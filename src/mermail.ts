@@ -10,9 +10,9 @@ function object(value: unknown): ObjectValue {
     throw new FlowError('invalid_response');
   return value as ObjectValue;
 }
-function string(o: ObjectValue, key: string): string {
+function string(o: ObjectValue, key: string, allowEmpty = false): string {
   const v = o[key];
-  if (typeof v !== 'string' || !v || v.length > 16_384)
+  if (typeof v !== 'string' || (!allowEmpty && !v) || v.length > 16_384)
     throw new FlowError('invalid_response');
   return v;
 }
@@ -53,7 +53,7 @@ function mail(value: unknown): Mail {
     id: string(o, 'id'),
     sender: string(o, 'sender'),
     recipient: string(o, 'recipient'),
-    subject: string(o, 'subject'),
+    subject: string(o, 'subject', true),
     date: string(o, 'date'),
     ...(typeof o.body === 'string' ? { body: o.body } : {}),
     clean: o.scan_status === 'clean',
@@ -116,8 +116,14 @@ export class Mermail implements Inbox {
                     ? 'remote_failure'
                     : 'invalid_response';
         const retry = response.headers.get('retry-after');
-        const seconds = retry && /^\d+$/.test(retry) ? Number(retry) : 0;
-        throw new FlowError(code, Math.min(seconds * 1000, 86_400_000));
+        const delay =
+          retry && /^\d+$/.test(retry)
+            ? Number(retry) * 1000
+            : Date.parse(retry ?? '') - Date.now();
+        throw new FlowError(
+          code,
+          Number.isNaN(delay) ? 0 : Math.min(Math.max(0, delay), 86_400_000),
+        );
       }
       // Bound the decoded stream too; Content-Length alone does not bound chunked data.
       const reader = response.body?.getReader();

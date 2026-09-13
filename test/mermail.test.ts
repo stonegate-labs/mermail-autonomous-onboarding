@@ -3,6 +3,33 @@ import { test } from 'node:test';
 import { Mermail } from '../src/mermail.js';
 
 const signal = () => new AbortController().signal;
+
+for (const [name, header, expected] of [
+  ['delta seconds', '2', 2000],
+  ['zero seconds', '0', 0],
+  ['future HTTP-date', 'Thu, 01 Jan 2026 00:00:02 GMT', 1500],
+  ['past HTTP-date', 'Wed, 31 Dec 2025 23:59:59 GMT', 0],
+  ['invalid date', 'not a date', 0],
+  ['delta clamp', '86401', 86_400_000],
+  ['date clamp', 'Sat, 03 Jan 2026 00:00:00 GMT', 86_400_000],
+] as const) {
+  test(`Retry-After supports ${name}`, async (t) => {
+    t.mock.method(Date, 'now', () => Date.parse('2026-01-01T00:00:00.500Z'));
+    const adapter = new Mermail(
+      'sk-proj-synthetic',
+      async () =>
+        new Response('private response', {
+          status: 429,
+          headers: { 'Retry-After': header },
+        }),
+    );
+    await assert.rejects(adapter.listMailboxes(signal()), {
+      code: 'rate_limited',
+      message: 'rate_limited',
+      retryAfterMs: expected,
+    });
+  });
+}
 const key = () => ['sk', 'proj', 'synthetic', String(Date.now())].join('-');
 function wire(id = 'message-one'): Record<string, unknown> {
   return {
@@ -220,6 +247,32 @@ test('malformed wire fields do not become trusted email', async () => {
     code: 'invalid_response',
   });
 });
+
+test('metadata snapshots allow empty subjects without retaining bodies', async () => {
+  const adapter = new Mermail(key(), async () =>
+    json([{ ...wire(), subject: '', body: 'unrelated content' }]),
+  );
+  const messages = await adapter.listEmails('mailbox', signal());
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0]?.subject, '');
+  assert.equal(messages[0]?.body, undefined);
+});
+
+for (const [name, subject] of [
+  ['missing', undefined],
+  ['null', null],
+  ['non-string', 42],
+  ['oversized', 'x'.repeat(16_385)],
+] as const) {
+  test(`metadata rejects ${name} subject`, async () => {
+    const adapter = new Mermail(key(), async () =>
+      json([{ ...wire(), subject }]),
+    );
+    await assert.rejects(adapter.listEmails('mailbox', signal()), {
+      code: 'invalid_response',
+    });
+  });
+}
 
 test('dot-segment IDs cannot escape the mailbox route', async () => {
   let calls = 0;

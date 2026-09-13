@@ -13,6 +13,7 @@ import { safeLink } from '../src/extraction.js';
 import { Budget } from '../src/polling.js';
 import { scopeName } from '../src/policy.js';
 import { liveAcceptance } from '../src/acceptance.js';
+import { Mermail } from '../src/mermail.js';
 
 const attemptId = 'test-attempt-00000001';
 function fixture(kind: 'code' | 'link' = 'code') {
@@ -506,6 +507,157 @@ test('message delivered exactly at cutoff is observed', async () => {
   assert.equal((await f.run()).status, 'success');
 });
 
+for (const [name, competitorDelay] of [
+  ['without a competitor', undefined],
+  ['with a competitor at cutoff', 1000],
+  ['with unrelated mail after cutoff', 1001],
+] as const) {
+  test(`poll crossing cutoff observes final snapshot ${name}`, async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const f = fixture();
+    const start = f.clock.now();
+    f.target.delayMs = 900;
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    let respond!: () => void;
+    const response = new Promise<void>((resolve) => {
+      respond = resolve;
+    });
+    const list = f.inbox.listEmails.bind(f.inbox);
+    const snapshots: number[] = [];
+    f.inbox.listEmails = async (id) => {
+      const at = f.clock.now() - start;
+      snapshots.push(at);
+      const messages = await list(id);
+      if (at === 900) {
+        enter();
+        await response;
+        if (competitorDelay !== undefined) {
+          const original = f.inbox.messages[0]!;
+          f.inbox.messages.push({
+            ...original,
+            at: start + competitorDelay,
+            mail: {
+              ...original.mail,
+              id: 'crossing-competitor',
+              date: new Date(start + competitorDelay).toISOString(),
+            },
+          });
+        }
+      }
+      return messages;
+    };
+    const result = f.run();
+    await entered;
+    f.clock.time += 200;
+    t.mock.timers.tick(200);
+    respond();
+    const r = await result;
+    const competitor = competitorDelay === f.policy.timeoutMs;
+    assert.equal(r.status, competitor ? 'failed' : 'success');
+    assert.equal(r.reason, competitor ? 'ambiguous' : undefined);
+    assert.equal(snapshots.at(-1), 1100);
+    assert.equal(f.target.continuations, competitor ? 0 : 1);
+  });
+}
+
+test('final snapshot I/O grace is bounded and aborts a hanging read', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = fixture();
+  const cutoff = f.clock.now() + f.policy.timeoutMs;
+  let enter!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enter = resolve;
+  });
+  let finalSignal: AbortSignal | undefined;
+  const list = f.inbox.listEmails.bind(f.inbox);
+  const inbox = {
+    listMailboxes: f.inbox.listMailboxes.bind(f.inbox),
+    createMailbox: f.inbox.createMailbox.bind(f.inbox),
+    getSafeEmail: f.inbox.getSafeEmail.bind(f.inbox),
+    listEmails: async (id: string, signal: AbortSignal) => {
+      if (f.clock.now() >= cutoff) {
+        finalSignal = signal;
+        enter();
+        return new Promise<Mail[]>(() => {});
+      }
+      if (f.clock.now() === cutoff - 100) f.clock.time += 200;
+      return list(id);
+    },
+  };
+  const result = onboard(inbox, f.target, f.policy, {
+    clock: f.clock,
+    attemptId,
+  });
+  await entered;
+  assert.equal(f.clock.now(), cutoff + 100);
+  f.clock.time += 9899;
+  t.mock.timers.tick(9899);
+  assert.equal(finalSignal?.aborted, false);
+  f.clock.time++;
+  t.mock.timers.tick(1);
+  assert.equal((await result).reason, 'timeout');
+  assert.equal(finalSignal?.aborted, true);
+  assert.equal(f.target.continuations, 0);
+});
+
+test('second-resolution delivery in the signup second is accepted', async () => {
+  const f = fixture();
+  f.clock.time += 500;
+  f.target.transform = (m) => [
+    { ...m, date: m.date.replace(/\.\d{3}Z$/, 'Z') },
+  ];
+  assert.equal((await f.run()).status, 'success');
+  assert.equal(f.target.continuations, 1);
+});
+
+test('second-resolution baseline mail in the signup second stays excluded', async () => {
+  const f = fixture();
+  f.clock.time += 500;
+  f.inbox.reuse(f.policy);
+  f.target.transform = (m) => [
+    { ...m, date: m.date.replace(/\.\d{3}Z$/, 'Z') },
+  ];
+  await f.target.start({
+    email: f.policy.mailboxEmail,
+    attemptId,
+    service: f.policy.service,
+  });
+  f.inbox.messages[0]!.at = f.clock.now();
+  f.target.start = async () => 'verification';
+  const r = await f.run();
+  assert.equal(r.reason, 'timeout');
+  assert.equal(
+    r.evidence.find((e) => e.event === 'baseline_recorded')?.count,
+    1,
+  );
+  assert.equal(f.inbox.reads, 0);
+  assert.equal(f.target.continuations, 0);
+});
+
+for (const [name, change] of [
+  ['previous second', (m: Mail) => ({ ...m, date: '2025-12-31T23:59:59Z' })],
+  [
+    'precise pre-signup date',
+    (m: Mail) => ({ ...m, date: '2026-01-01T00:00:00.499Z' }),
+  ],
+  ['past upper bound', (m: Mail) => ({ ...m, date: '2026-01-01T00:00:02Z' })],
+  ...mismatches.filter(([name]) => name.includes('wrong')),
+] as [string, (m: Mail) => Mail][]) {
+  test(`second-resolution correlation rejects ${name}`, async () => {
+    const f = fixture();
+    f.clock.time += 500;
+    f.target.transform = (m) => [
+      change({ ...m, date: m.date.replace(/\.\d{3}Z$/, 'Z') }),
+    ];
+    assert.equal((await f.run()).reason, 'timeout');
+    assert.equal(f.inbox.reads, 0);
+    assert.equal(f.target.continuations, 0);
+  });
+}
+
 test('competing message delivered exactly at cutoff blocks consumption', async () => {
   const f = fixture();
   const list = f.inbox.listEmails.bind(f.inbox);
@@ -573,6 +725,98 @@ test('transient detail failure is retried, not marked consumed', async () => {
   };
   assert.equal((await f.run()).status, 'success');
   assert.equal(f.target.continuations, 1);
+});
+
+for (const failingFirst of [false, true]) {
+  for (const outcome of ['unresolved', 'succeeds', 'changes'] as const) {
+    test(`retains omitted matching IDs with failing detail ${failingFirst ? 'first' : 'last'}: ${outcome}`, async () => {
+      const f = fixture();
+      f.target.transform = (m) => {
+        const competitor = { ...m, id: 'competitor' };
+        return failingFirst ? [competitor, m] : [m, competitor];
+      };
+      const list = f.inbox.listEmails.bind(f.inbox);
+      const get = f.inbox.getSafeEmail.bind(f.inbox);
+      let failures = 0;
+      let attempts = 0;
+      const snapshots: number[] = [];
+      f.inbox.listEmails = async (b) => {
+        snapshots.push(f.clock.now());
+        const messages = await list(b);
+        // Omit the entire original queue after failure, including IDs whose
+        // detail read was queued behind the failing one.
+        return failures ? [] : messages;
+      };
+      f.inbox.getSafeEmail = async (b, id) => {
+        if (id === 'competitor') {
+          attempts++;
+          if (failures++ === 0 || outcome === 'unresolved')
+            throw new FlowError('transport');
+          const detail = await get(b, id);
+          return outcome === 'changes'
+            ? { ...detail, recipient: 'other@mermail.app' }
+            : detail;
+        }
+        return get(b, id);
+      };
+      const r = await f.run();
+      assert.equal(r.status, 'failed');
+      assert.equal(
+        r.reason,
+        outcome === 'unresolved'
+          ? 'timeout'
+          : outcome === 'succeeds'
+            ? 'ambiguous'
+            : 'message_changed',
+      );
+      assert.equal(f.target.continuations, 0);
+      assert.ok(attempts >= 2 && attempts <= 4);
+      assert.ok(r.evidence.some((e) => e.event === 'retry'));
+      if (outcome === 'unresolved')
+        // The next required backoff exceeds the remaining observation time.
+        assert.equal(snapshots.at(-1), Date.parse('2026-01-01T00:00:00.900Z'));
+      assert.ok(!JSON.stringify(r).includes(f.inbox.messages[0]!.mail.body!));
+    });
+  }
+}
+
+test('single matching ID omitted after transient detail failure can still succeed', async () => {
+  const f = fixture();
+  const list = f.inbox.listEmails.bind(f.inbox);
+  const get = f.inbox.getSafeEmail.bind(f.inbox);
+  let attempts = 0;
+  f.inbox.listEmails = async (b) => (attempts ? [] : list(b));
+  f.inbox.getSafeEmail = async (b, id) => {
+    if (++attempts === 1) throw new FlowError('remote_failure');
+    return get(b, id);
+  };
+  assert.equal((await f.run()).status, 'success');
+  assert.equal(attempts, 3); // Failure, successful retry, final re-read.
+  assert.equal(f.target.continuations, 1);
+});
+
+test('HTTP-date Retry-After beyond observation deadline stops without an early retry', async (t) => {
+  const f = fixture();
+  t.mock.method(Date, 'now', () => f.clock.now());
+  let requests = 0;
+  const adapter = new Mermail('sk-proj-synthetic', async () => {
+    requests++;
+    return new Response('private remote text', {
+      status: 429,
+      headers: { 'Retry-After': 'Thu, 01 Jan 2026 00:00:02 GMT' },
+    });
+  });
+  const list = f.inbox.listEmails.bind(f.inbox);
+  f.inbox.listEmails = async (b) =>
+    f.target.starts
+      ? adapter.listEmails(b, new AbortController().signal)
+      : list(b);
+  const r = await f.run();
+  assert.equal(r.reason, 'timeout');
+  assert.equal(requests, 1);
+  assert.deepEqual(f.clock.sleeps, []);
+  assert.equal(f.target.continuations, 0);
+  assert.ok(!JSON.stringify(r).includes('private remote text'));
 });
 
 test('runtime error-code injection cannot enter redacted evidence', async () => {

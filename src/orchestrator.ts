@@ -71,15 +71,19 @@ export async function onboard(
       ),
     );
     emit('signup_started');
+    // Polls may finish after the arrival cutoff. Give all observation I/O a
+    // fixed grace window, including the final snapshot and candidate reads;
+    // this never extends the timestamps eligible for correlation.
+    deadline = arrivalDeadline + 10_000;
     const candidates = new Map<string, Mail>();
+    const unresolved = new Set<string>();
     const seen = new Map<string, string>();
     let backoff = p.initialBackoffMs;
     let successfulPoll = false;
     while (true) {
       const finalPoll = clock.now() >= arrivalDeadline;
-      // Final snapshot includes the cutoff itself; its bounded I/O grace does
-      // not extend which message timestamps can satisfy this attempt.
-      if (finalPoll) deadline = arrivalDeadline + 10_000;
+      // Always take a final snapshot, even when the preceding poll crossed
+      // the cutoff. The shared I/O deadline is never renewed while polling.
       let wait = backoff;
       try {
         const messages = await guarded.listEmails(
@@ -110,14 +114,18 @@ export async function onboard(
             if (prior === undefined) emit('message_rejected');
             continue;
           }
-          if (candidates.has(m.id)) continue; // Repeated snapshots never consume twice.
+          if (!candidates.has(m.id)) unresolved.add(m.id);
+        }
+        // Record the whole snapshot before fallible detail I/O. An observed
+        // matching ID remains unresolved even if subsequent lists omit it.
+        for (const id of unresolved) {
           const detail = await guarded.getSafeEmail(
             mailbox.id,
-            m.id,
+            id,
             placeholderSignal,
           );
           if (
-            detail.id !== m.id ||
+            detail.id !== id ||
             !correlates(
               detail,
               p,
@@ -128,7 +136,8 @@ export async function onboard(
           )
             throw new FlowError('message_changed');
           extract(detail, p, attemptId); // Validate all candidates, without logging/persisting the value.
-          candidates.set(m.id, detail);
+          candidates.set(id, detail);
+          unresolved.delete(id);
           if (candidates.size > 1) throw new FlowError('ambiguous');
           emit('email_correlated');
         }
@@ -145,7 +154,7 @@ export async function onboard(
       if (remaining > 0) await clock.sleep(Math.min(wait, remaining));
       backoff = Math.min(backoff * 2, p.maxBackoffMs);
     }
-    if (!successfulPoll || candidates.size !== 1)
+    if (!successfulPoll || candidates.size !== 1 || unresolved.size !== 0)
       throw new FlowError('timeout');
     const chosen = [...candidates.values()][0]!;
     // Re-read after the observation window: fail closed if the accepted content changed.

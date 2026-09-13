@@ -26,6 +26,11 @@ export function correlates(
       ? from === address(p.sender.address)
       : from.split('@')[1] === p.sender.domain.toLowerCase();
   const time = Date.parse(m.date);
+  // A timestamp without fractional seconds can represent any arrival in
+  // that second. Only relax the lower bound; keep the exact upper cutoff.
+  const earliest = m.date.includes('.')
+    ? start
+    : Math.floor(start / 1000) * 1000;
   return (
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(
       m.date,
@@ -33,7 +38,7 @@ export function correlates(
     senderMatches &&
     to === address(p.mailboxEmail) &&
     Number.isFinite(time) &&
-    time >= start &&
+    time >= earliest &&
     time <= end &&
     m.subject === `${p.subject} [${attemptId}]`
   );
