@@ -52,7 +52,16 @@ The suite currently contains **94 passing tests**. The local OTP/create and link
 
 ## Clean-clone verification
 
-The final clean-clone result is recorded here after running all four required commands against committed feature-branch contents with fresh dependencies.
+Verified on 2026-09-13 from a fresh HTTPS clone of the feature branch at implementation commit `f2801c50bd78e00b7aee3a02a716e9b319b6e067`, using Node `22.23.1` and npm `10.9.8`. No dependencies or build output were copied into the clone. Its working tree remained clean after verification.
+
+| Exact command   | Result                                                                       |
+| --------------- | ---------------------------------------------------------------------------- |
+| `npm ci`        | Exit 0; four packages installed, five audited, zero reported vulnerabilities |
+| `npm run check` | Exit 0; strict type/static checks and formatting passed; 94 tests passed     |
+| `npm test`      | Exit 0; 94 passed, zero failed/cancelled/skipped                             |
+| `npm run build` | Exit 0                                                                       |
+
+The [GitHub Actions run](https://github.com/stonegate-labs/mermail-autonomous-onboarding/actions/runs/34728660624) also passed all four commands plus both demos on `ubuntu-latest` and `windows-latest`, using Node 22. The skill frontmatter and 13 local documentation references were checked independently. Public artifact scanning found no private paths, machine identity, real credential patterns or unrelated project references.
 
 ## Live acceptance status
 

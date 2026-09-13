@@ -9,7 +9,7 @@ The repeatable demo joins a local HTTP SaaS to delayed email delivery. An execut
 ## Links and client
 
 - Repository: https://github.com/stonegate-labs/mermail-autonomous-onboarding
-- Project review PR: `PROJECT_PR_URL` (replace after publication).
+- Project review PR: https://github.com/stonegate-labs/mermail-autonomous-onboarding/pull/1.
 - Required upstream PR to https://github.com/Nudgen-Marketing/mermail-skills: `UPSTREAM_PR_URL`.
 - English 2–5 minute video posted on X, tagging `@Mermailapp`: `DEMO_X_URL`.
 - AI client demonstrated: `RECORDED_CLIENT_AND_VERSION` (fill from the actual recording).
